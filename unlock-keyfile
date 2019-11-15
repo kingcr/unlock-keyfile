@@ -1,0 +1,272 @@
+#!/bin/sh
+
+# *****************************************************************************
+# keyfile-unlock
+#
+# Unlock an encrypted root device using:
+#    1. A specified keyfile stored on a specified device
+#    2. A user-entered password on the console
+#    3. A user-entered password via SSH (e.g. cryptroot-unlock)
+#
+# When using a keyfile, this must be specified on the kernel commandline as:
+#    crypt_keyfile=<device>:<keyfile>
+# Where:
+#    <device>  ::= UUID=nnnnnn | LABEL=nnnnnn | /dev/sdN
+#    <keyfile> ::= the relative path to the file on <device>
+#
+# *****************************************************************************
+
+# -----------------------------------------------------------------------------
+# User-configurable variables
+# -----------------------------------------------------------------------------
+
+# Print verbose debugging messages?
+DEBUG=0
+
+# Seconds to wait for the specified key device (e.g. usb) to appear
+DEVICE_TIMEOUT=10
+
+# Modules to automatically load
+LOAD_MODULES="ext2 ext3 ext4 xfs vfat usb_storage mmc_block sdhci"
+
+# -----------------------------------------------------------------------------
+# Internal control variables
+# -----------------------------------------------------------------------------
+
+# Name of keyfile on key device
+KEYFILE=
+
+# Name of key device
+KEYDEV=
+
+# Whether or not the keyfile could be read from the key device
+KEY_SUCCESS=0
+
+# Where to temporarily mount the key device in order the read the keyfile
+MOUNTPOINT=/tmp-keyfile-unlock
+
+# Program version
+VERSION=1.1
+
+# -----------------------------------------------------------------------------
+# Print a given string to stderr
+# -----------------------------------------------------------------------------
+
+msg()
+{
+   if [ $# -gt 0 ]; then
+      echo "$@" >&2
+   fi
+}
+
+# -----------------------------------------------------------------------------
+# Conditionally print a given string, if DEBUG is set to 1
+# -----------------------------------------------------------------------------
+
+debug_msg()
+{
+   if [ $DEBUG -eq 1 ]; then
+      msg "[DEBUG] $@"
+   fi
+}
+
+# ----------------------------------------------------------------------------
+# Use cryptsetup's askpass to allow the user to enter the password
+#
+# Note: It would be sufficient to simply obtain a password (e.g. using stty)
+#       and echo it out. However, this would not allow for unified SSH logins.
+#       Instead, askpass creates a named pipe which exists while it blocks
+#       for user input. This pipe allows a password to be sent to askpass
+#       from an SSH session as long as this script is waiting for input.
+# -----------------------------------------------------------------------------
+
+user_password()
+{
+   debug_msg "Reading password from console"
+   local PASS=`/lib/cryptsetup/askpass "Please unlock disk $CRYPTTAB_NAME: "`
+   echo -n $PASS
+   echo >&2
+}
+
+# -----------------------------------------------------------------------------
+# Load a named module, if not already loaded
+# -----------------------------------------------------------------------------
+
+load_module()
+{
+   if [ $# -gt 0 ]; then
+      debug_msg "Request to load module '$1'"
+      cat /proc/modules | busybox grep $1 >/dev/null 2>&1
+      if [ $? -ne 0 ]; then
+         debug_msg "Loading module '$1'"
+         modprobe $1 > /dev/null 2>&1
+         if [ $? -eq 0 ]; then 
+            msg "Loaded module '$1'."
+          else
+            msg "Failed to load module '$1'."
+         fi
+      fi
+   fi
+}
+
+# -----------------------------------------------------------------------------
+# Parse kernel command line to find the keyfile location
+# -----------------------------------------------------------------------------
+
+find_keyfile_location()
+{
+   debug_msg "Finding keyfile location"
+   local KEYFILE_LOCATION=
+   # Seek out the crypt_keyfile entry in the command line
+   for OPT in $(cat /proc/cmdline); do
+      case $OPT in
+         crypt_keyfile=*)
+            KEYFILE_LOCATION="${OPT#crypt_keyfile=}"
+            ;;
+      esac
+   done
+
+   debug_msg "crypt_keyfile parameter is '$KEYFILE_LOCATION'"
+
+   if [ ! -z $KEYFILE_LOCATION ]; then
+      # The device is the first part of the value
+      # Refactor the path depending on the reference
+      case $KEYFILE_LOCATION in
+         [Uu][Uu][Ii][Dd]=*)
+            KEYDEV="${KEYFILE_LOCATION#[Uu][Uu][Ii][Dd]=}"
+            KEYDEV="/dev/disk/by-uuid/${KEYDEV%%:*}"
+         ;;
+         [Ll][Aa][Bb][Ee][Ll]=*)
+            KEYDEV="${KEYFILE_LOCATION#[Ll][Aa][Bb][Ee][Ll]=}"
+            KEYDEV="/dev/disk/by-label/${KEYDEV%%:*}"
+         ;;
+         *)
+            KEYDEV="/dev/${KEYFILE_LOCATION%%:*}"
+         ;;
+      esac
+      # The keyfile name is the second part of the value
+      KEYFILE=`echo "$KEYFILE_LOCATION" | cut -d: -f2-`
+   fi
+
+   msg " "
+   msg "Device  : $KEYDEV"
+   msg "Keyfile : $KEYFILE"
+   msg " "
+
+   # Both the keyfile device and filename are required
+   if [ -z $KEYFILE ] || [ -z $KEYDEV ]; then
+      msg "WARNING: Invalid keyfile or device specified."
+      KEYFILE=
+      KEYDEV=
+   fi
+
+}
+
+
+# -----------------------------------------------------------------------------
+# Initialisation
+# -----------------------------------------------------------------------------
+
+initialise()
+{
+   debug_msg "Initialising"
+   for MODULE in $LOAD_MODULES; do
+      load_module $MODULE
+   done
+
+   find_keyfile_location
+
+   mkdir -p $MOUNTPOINT
+   if [ $? -ne 0 ]; then
+      msg "ERROR: Failed to create mountpoint '$MOUNTPOINT'."
+   fi
+
+}
+
+# -----------------------------------------------------------------------------
+# Attempt to open the keyfile and output the contents
+# -----------------------------------------------------------------------------
+
+open_with_keyfile()
+{
+   debug_msg "Attempting to open using keyfile"
+
+   KEY_SUCCESS=0
+
+   # Wait for the key device to appear (to allow for "settling")
+   msg "Waiting up to ${DEVICE_TIMEOUT}s for device..."
+   local i=$(($DEVICE_TIMEOUT*10))
+   while [ ! -b $KEYDEV ]; do
+      sleep 0.1
+      i=$(($i-1))
+      if [ $i -eq 0 ]; then
+         break
+      fi
+   done
+
+   # Check that the device is now present
+   if [ ! -b $KEYDEV ]; then
+      msg "ERROR: Device not found."
+   else
+      msg "Device found."
+      # Mount the device (automatic filesystem determination)
+      mount $KEYDEV $MOUNTPOINT >/dev/null 2>&1
+      if [ $? -ne 0 ]; then
+         msg "ERROR: Failed to mount device."
+      else
+         # Device mounted, now look for keyfile
+         local PASS=
+         if [ -f "$MOUNTPOINT/$KEYFILE" ]; then
+            debug_msg "Read keyfile contents at '$MOUNTPOINT/$KEYFILE'"
+            # Just take key as the entire contents of the file
+            PASS=`cat "$MOUNTPOINT/$KEYFILE"`
+         else
+            msg "ERROR: Keyfile not found on device."
+         fi
+         # Clean up
+         debug_msg "Unmounting device from '$MOUNTPOINT'"
+         umount $MOUNTPOINT >/dev/null 2>&1
+         if [ $? -ne 0 ]; then
+            msg "WARNING: Failed to unmount device."
+         fi
+         if [ ! -z $PASS ]; then
+            # Found keyfile and it contains something, just echo it out
+            msg "Unlocking using keyfile on device."
+            KEY_SUCCESS=1
+            echo -n $PASS
+            echo >&2
+            # There is no way to know if the keyfile contents successfully
+            # unlocks the encrypted device!
+         fi
+      fi
+   fi
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+debug_msg "Keyfile-unlock starting"
+
+msg "-------------------------------------------------------------------------------"
+msg "keyfile-unlock version $VERSION"
+msg " "
+
+initialise
+
+if [ ! -z $KEYDEV ] && [ ! -z $KEYFILE ]; then
+   # Where a "valid" keyfile and device combination was specified, attempt to
+   # use it to find the key and unlock the device
+   open_with_keyfile
+   if [ $KEY_SUCCESS -ne 1 ]; then
+      # If the keyfile or device could not be found, fall back to user password
+      echo >&2
+      user_password
+   fi
+else
+   # No keyfile or device - only user password entry is possible
+   user_password
+fi
+
+debug_msg "Keyfile-unlock complete"
+msg "-------------------------------------------------------------------------------"
